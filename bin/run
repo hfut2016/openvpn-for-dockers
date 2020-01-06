@@ -1,0 +1,168 @@
+#!/bin/sh
+
+PASS="输入数据库密码"
+USER="输入数据库用户" 
+DB="输入数据库"
+HOST="输入数据库地址"
+TABLE="输入数据库用于验证用户的表"
+
+set -e
+
+[ -d /dev/net ] ||
+    mkdir -p /dev/net
+[ -c /dev/net/tun ] ||
+    mknod /dev/net/tun c 10 200
+
+cd /etc/openvpn
+# This file tells `serveconfig` that there is a config there
+touch placeholder
+[ -f dh.pem ] ||
+    openssl dhparam -out dh.pem 1024
+[ -f key.pem ] ||
+    openssl genrsa -out key.pem 2048
+chmod 600 key.pem
+[ -f csr.pem ] ||
+    openssl req -new -key key.pem -out csr.pem -subj /CN=OpenVPN/
+[ -f cert.pem ] ||
+    openssl x509 -req -in csr.pem -out cert.pem -signkey key.pem -days 24855
+
+[ -f checkpsw.sh ] || cat >checkpsw.sh <<EOF
+#!/bin/sh
+###########################################################
+# checkpsw.sh (C) 2004 Mathias Sundman <mathias@openvpn.se>
+#
+# This script will authenticate OpenVPN users against
+# a plain text file. The passfile should simply contain
+# one row per user with the username first followed by
+# one or more space(s) or tab(s) and then the password.
+
+PASS="${PASS}"
+USER="${USER}" 
+DB="${DB}"
+HOST="${HOST}"
+TABLE="${TABLE}"
+
+PASSFILE="/etc/openvpn/psw-file"
+LOG_FILE="/etc/openvpn/login-openvpn.log"
+TIME_STAMP=\`date "+%Y-%m-%d %T"\`
+
+###########################################################
+
+USER_ID=\`echo "SELECT user_id FROM \${TABLE} WHERE user_name='\${username}'" | /usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB} | grep -v user_id \`
+USER_STATE=\`echo "SELECT user_state FROM \${TABLE} WHERE user_name='\${username}' AND user_passwd=password('\${password}')" | /usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB} | grep -v user_state \`
+
+if [ "\${USER_ID}" = "" ]; then 
+  echo "\${TIME_STAMP}: User does not exist: username=\"\${username}\", password=\"\${password}\"." >> \${LOG_FILE}
+  exit 1
+fi
+
+if [ "\${USER_STATE}" = "1" ]; then 
+  echo "\${TIME_STAMP}: Successful authentication: username=\"\${username}\"." >> \${LOG_FILE}
+  exit 0
+fi
+
+echo "\${TIME_STAMP}: Incorrect password: username=\"\${username}\", password=\"\${password}\", , state=\"\${USER_STATE}\"." >> \${LOG_FILE}
+exit 1
+EOF
+chmod +x checkpsw.sh
+
+[ -f connect ] || cat >connect <<EOF
+#!/bin/bash
+
+PASS="${PASS}"
+USER="${USER}" 
+DB="${DB}"
+HOST="${HOST}"
+TABLE="${TABLE}"
+DATE=\`date +%Y%m%d\`
+TIME=\`date +%T\`
+
+echo "insert into user_log (user_name,login_date,login_time,logout_date,logout_time,get_ip,from_ip) values ('\${username}','\${DATE}','\${TIME}','1997-07-01','00:00:00','\${ifconfig_pool_remote_ip}','\${trusted_ip}')" |/usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB}
+echo "update user_vpn set user_state='2' where user_name='\${username}' and user_name!='hfutvpn'" |/usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB}
+#
+UU=\`echo "select count(*) as ckq from user_vpn where user_state='2' " |/usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB}\`CS=\`echo \${UU:4}\`
+echo "insert into tj_log (t_date,t_time,t_num) values ('\${DATE}','\${TIME}','\${CS}') " |/usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB}
+EOF
+chmod +x connect
+
+[ -f disconnect ] || cat >disconnect <<EOF
+#!/bin/bash
+
+PASS="${PASS}"
+USER="${USER}"
+DB="${DB}"
+HOST="${HOST}"
+TABLE="${TABLE}"
+DATE=\`date +%Y%m%d\`
+TIME=\`date +%T\`
+ 
+echo "update user_vpn set user_state='1' where user_name='\${username}'"|/usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB}
+echo "update user_log set logout_date='\${DATE}',logout_time='\${TIME}' where user_name='\${username}' and logout_date='1997-07-01'" |/usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB}
+EOF
+chmod +x disconnect
+
+[ -f udp1194.conf ] || cat >udp1194.conf <<EOF
+server-bridge 121.251.16.1 255.255.255.0 121.251.16.100 121.251.16.240
+verb 3
+duplicate-cn
+key key.pem
+ca cert.pem
+cert cert.pem
+dh dh.pem
+keepalive 10 60
+persist-key
+persist-tun
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 222.195.2.42"
+
+script-security 3
+auth-user-pass-verify /etc/openvpn/checkpsw.sh via-env
+client-connect /etc/openvpn/connect
+client-disconnect /etc/openvpn/disconnect
+
+proto udp
+port 1194
+dev tap0
+status openvpn-status-1194.log
+EOF
+
+MY_IP_ADDR=$(curl -s http://myip.enix.org/REMOTE_ADDR)
+[ "$MY_IP_ADDR" ] || {
+    echo "Sorry, I could not figure out my public IP address."
+    echo "(I use http://myip.enix.org/REMOTE_ADDR/ for that purpose.)"
+    exit 1
+}
+
+[ -f client.ovpn ] || cat >client.ovpn <<EOF
+client
+nobind
+dev tap
+redirect-gateway def1
+auth-user-pass
+<key>
+`cat key.pem`
+</key>
+<cert>
+`cat cert.pem`
+</cert>
+<ca>
+`cat cert.pem`
+</ca>
+<dh>
+`cat dh.pem`
+</dh>
+
+<connection>
+remote $MY_IP_ADDR 1194 udp
+</connection>
+
+<connection>
+remote $MY_IP_ADDR 443 tcp-client
+</connection>
+EOF
+
+iptables -t nat -A POSTROUTING -s 192.168.255.0/24 -o eth0 -j MASQUERADE
+
+touch udp1194.log http8080.log
+while true ; do openvpn udp1194.conf ; done >> udp1194.log &
+tail -F *.log
