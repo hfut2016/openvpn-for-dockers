@@ -103,39 +103,75 @@ echo "update user_log set logout_date='\${DATE}',logout_time='\${TIME}' where us
 EOF
 chmod +x disconnect
 
+[ -f init_db.sh ] || cat >init_db.sh <<EOF
+#!/bin/bash
+
+PASS="${PASS}"
+USER="${USER}"
+DB="${DB}"
+HOST="${HOST}"
+TABLE="${TABLE}"
+DATE=\`date +%Y%m%d\`
+TIME=\`date +%T\`
+ 
+echo "update user_vpn set user_state='1' where user_state='2'"|/usr/bin/mysql -h\${HOST} -u\${USER} -p\${PASS} \${DB}
+EOF
+chmod +x init_db.sh
+
 [ -f udp1194.conf ] || cat >udp1194.conf <<EOF
-server-bridge 121.251.16.1 255.255.255.0 121.251.16.100 121.251.16.240
-verb 3
-duplicate-cn
+local $MY_IP_ADDR
+proto udp
+port 1194
+dev tap0
+
+server-bridge 121.251.16.1 255.255.255.0 121.251.16.128 121.251.16.159
+
 key key.pem
 ca cert.pem
 cert cert.pem
 dh dh.pem
-keepalive 10 60
+
+ifconfig-pool-persist ipp.txt
+push "redirect-gateway def1"
+push "dhcp-option DNS 222.195.2.42"
+
+client-to-client
+comp-lzo
+client-cert-not-required
+tls-auth /etc/openvpn/ta.key 0
+username-as-common-name
+keepalive 10 120
+
 persist-key
 persist-tun
-push "dhcp-option DNS 8.8.8.8"
-push "dhcp-option DNS 222.195.2.42"
+
+reneg-sec 0
+explicit-exit-notify 1
 
 script-security 3
 auth-user-pass-verify /etc/openvpn/checkpsw.sh via-env
 client-connect /etc/openvpn/connect
 client-disconnect /etc/openvpn/disconnect
-
-proto udp
-port 1194
-dev tap0
-status openvpn-status-1194.log
 EOF
-
-[ "$MY_IP_ADDR" ] || MY_IP_ADDR=$(curl -s http://myip.enix.org/REMOTE_ADDR)
 
 [ -f client.ovpn ] || cat >client.ovpn <<EOF
 client
+
+remote $MY_IP_ADDR 1194 udp
 nobind
 dev tap
 redirect-gateway def1
 auth-user-pass
+
+comp-lzo
+persist-key
+persist-tun
+tls-auth docker_ta.key 1
+comp-lzo
+
+verb 5
+
+explicit-exit-notify 6
 <key>
 `cat key.pem`
 </key>
@@ -149,14 +185,12 @@ auth-user-pass
 `cat dh.pem`
 </dh>
 
-<connection>
-remote $MY_IP_ADDR 1194 udp
-</connection>
-
 EOF
 
-iptables -t nat -A POSTROUTING -s 192.168.255.0/24 -o eth0 -j MASQUERADE
+[ -f ta.key ] ||
+    openvpn --genkey --secret ta.key
 
-touch udp1194.log http8080.log
+touch udp1194.log 
+echo `./init_db.sh`
 while true ; do openvpn udp1194.conf ; done >> udp1194.log &
 tail -F *.log
